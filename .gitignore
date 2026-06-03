@@ -1,0 +1,21 @@
+# Cache do Python
+__pycache__/
+*.py[cod]
+
+# Dados baixados da Anatel (recriados ao rodar; podem ser grandes)
+dados_anatel/
+*.csv
+*.zip
+
+# Estado e log locais (de uso pessoal, não fazem parte do código)
+anatel_smp_estado.json
+anatel_smp_log.txt
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Configs de editor/IDE
+.vscode/
+.idea/
