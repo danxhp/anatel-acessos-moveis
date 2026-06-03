@@ -28,12 +28,30 @@ Arquivo principal: [monitor_anatel_smp.py](monitor_anatel_smp.py).
 - Saídas esperadas: `✅ DADO NOVO DISPONÍVEL: <mês>/<ano>...` ou
   `⏳ AINDA NÃO: a competência mais recente é <mês/ano>...`.
 
-## Arquivos gerados (não versionar / não editar à mão)
+## Arquivos gerados
 
-- `anatel_smp_log.txt` — histórico append-only de cada checagem (data + resultado).
-- `anatel_smp_estado.json` — última competência vista (controle de idempotência).
-- `dados_anatel/` — CSVs baixados da Anatel.
-- `__pycache__/` — cache do Python.
+- `anatel_smp_estado.json` — última competência vista. **Versionado de propósito**:
+  é assim que o GitHub Actions persiste o estado entre execuções (e decide se houve
+  novidade para mandar e-mail). Não editar à mão.
+- `anatel_smp_log.txt` — histórico append-only de cada checagem (ignorado pelo git).
+- `email_config.json` — credenciais SMTP. **Nunca versionar** (no Actions vem do
+  secret `EMAIL_CONFIG_JSON`); está no `.gitignore`.
+- `dados_anatel/`, `__pycache__/` — baixados/cache; ignorados.
+
+## Automação (GitHub Actions) e e-mail
+
+- Workflow: [.github/workflows/monitor.yml](.github/workflows/monitor.yml) — cron a
+  cada 30 min (`13,43 * * * *`) + `workflow_dispatch`. Escreve `email_config.json` a
+  partir do secret, roda o script e commita `anatel_smp_estado.json` de volta.
+- Padrão copiado de `github.com/danxhp/cvm-fatos-relevantes`.
+- **Secrets necessários no repositório** (Settings → Secrets and variables → Actions):
+  - `EMAIL_CONFIG_JSON` — JSON com `enabled:true`, `smtp_*` (Gmail: senha de APP,
+    porta 465 ou 587) e `to_addrs`.
+  - `CHAVE_DADOS_GOV` — chave gratuita do dados.gov.br. **Necessária nos runners do
+    GitHub (EUA)**: sem chave a API responde HTTP 401.
+- E-mail (`enviar_email` + `_render_email_html`): disparado **só quando a competência
+  muda** (nova publicação) e nunca na primeira execução (evita alerta no marco zero).
+  Idempotente — não reenvia se nada mudou.
 
 ## Fonte de dados (confirmado)
 

@@ -1,0 +1,57 @@
+name: Monitor Anatel SMP
+
+on:
+  schedule:
+    # A cada 30 min (minutos 13 e 43 para evitar o congestionamento do topo da hora).
+    - cron: '13,43 * * * *'
+  workflow_dispatch:            # permite disparar manualmente pela aba Actions
+
+permissions:
+  contents: write               # necessário pra commitar anatel_smp_estado.json de volta
+
+concurrency:
+  group: anatel-smp-monitor
+  cancel-in-progress: false     # evita execuções concorrentes pisando no estado
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Write email_config.json from secret
+        env:
+          EMAIL_CONFIG: ${{ secrets.EMAIL_CONFIG_JSON }}
+        run: printf '%s' "$EMAIL_CONFIG" > email_config.json
+
+      - name: Run monitor
+        env:
+          # Chave gratuita do dados.gov.br (necessária fora do Brasil; os runners do
+          # GitHub ficam nos EUA). Cadastre o secret CHAVE_DADOS_GOV no repositório.
+          CHAVE_DADOS_GOV: ${{ secrets.CHAVE_DADOS_GOV }}
+        run: python monitor_anatel_smp.py
+
+      - name: Commit updated state
+        if: always()              # roda mesmo se o passo anterior falhar
+        run: |
+          rm -f email_config.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add anatel_smp_estado.json
+          if git diff --staged --quiet; then
+            echo "Sem mudança de competência, nada a commitar."
+          else
+            git commit -m "chore: atualiza estado do monitor SMP [skip ci]"
+            git push
+          fi

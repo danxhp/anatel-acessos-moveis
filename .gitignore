@@ -7,9 +7,14 @@ dados_anatel/
 *.csv
 *.zip
 
-# Estado e log locais (de uso pessoal, não fazem parte do código)
-anatel_smp_estado.json
+# Log local (de uso pessoal, não faz parte do código)
 anatel_smp_log.txt
+
+# Credenciais de e-mail: NUNCA versionar (no GitHub Actions vem do secret)
+email_config.json
+
+# OBS: anatel_smp_estado.json é versionado de propósito — é assim que o GitHub
+# Actions guarda a última competência vista entre execuções (state persistence).
 
 # Ambientes virtuais
 .venv/

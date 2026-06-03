@@ -31,10 +31,12 @@ import io
 import json
 import os
 import re
+import smtplib
 import sys
 import time
 import zipfile
 from datetime import datetime, date
+from email.message import EmailMessage
 import unicodedata
 
 import requests
@@ -61,8 +63,10 @@ DATASET_SLUG = "acessos-autorizadas-smp"
 PASTA_DOWNLOAD = r"c:\dev\Acessos_Moveis\dados_anatel"
 
 # Arquivos de apoio (ficam ao lado deste script).
-ARQ_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "anatel_smp_log.txt")
-ARQ_ESTADO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "anatel_smp_estado.json")
+_DIR = os.path.dirname(os.path.abspath(__file__))
+ARQ_LOG = os.path.join(_DIR, "anatel_smp_log.txt")
+ARQ_ESTADO = os.path.join(_DIR, "anatel_smp_estado.json")
+ARQ_EMAIL_CONFIG = os.path.join(_DIR, "email_config.json")
 
 # User-Agent de navegador comum (a Anatel/dados.gov.br às vezes bloqueia clientes "crus").
 USER_AGENT = (
@@ -519,6 +523,160 @@ def imprimir_agregados(agg):
 
 
 # ===========================================================================
+# ALERTA POR E-MAIL
+# ===========================================================================
+
+# Template de configuração. O envio só ocorre se "enabled" = true e houver
+# credenciais SMTP. No GitHub Actions este arquivo é escrito a partir do secret
+# EMAIL_CONFIG_JSON; localmente você pode editar o arquivo gerado.
+DEFAULT_EMAIL_CONFIG = {
+    "enabled": False,
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 587,
+    "smtp_username": "",          # seu e-mail (login SMTP)
+    "smtp_password": "",          # senha de APP do Gmail (não a senha normal)
+    "from_addr": "",             # opcional; se vazio usa smtp_username
+    "to_addrs": ["danxhp@gmail.com"],
+    "subject_prefix": "[Anatel SMP]",
+}
+
+
+def load_email_config():
+    """
+    Lê email_config.json. Se não existir, cria um template e retorna None.
+    Retorna o dict só se estiver 'enabled' e com credenciais/destinatários válidos.
+    """
+    if not os.path.exists(ARQ_EMAIL_CONFIG):
+        with open(ARQ_EMAIL_CONFIG, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_EMAIL_CONFIG, f, indent=2, ensure_ascii=False)
+        print(f"ℹ️  Criado template {os.path.basename(ARQ_EMAIL_CONFIG)}. "
+              "Edite (enabled=true + credenciais SMTP) para receber e-mails.")
+        return None
+    try:
+        with open(ARQ_EMAIL_CONFIG, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"⚠️  Falha ao ler email_config.json: {e}")
+        return None
+    if not cfg.get("enabled"):
+        log_verbose("E-mail desabilitado (enabled=false).")
+        return None
+    if not cfg.get("smtp_username") or not cfg.get("smtp_password"):
+        print("⚠️  email_config.json sem smtp_username/smtp_password.")
+        return None
+    if not cfg.get("to_addrs"):
+        print("⚠️  email_config.json com to_addrs vazio.")
+        return None
+    return cfg
+
+
+def _render_email_html(comp_extenso, atualizado, agg):
+    """Monta o corpo HTML do alerta com total Brasil + quebras."""
+    def linhas(dic, ordem):
+        if not dic:
+            return ""
+        itens = "".join(
+            f'<tr><td style="padding:4px 0;color:#2d3748;">{nome}</td>'
+            f'<td style="padding:4px 0;text-align:right;font-weight:600;color:#1a202c;">'
+            f'{_fmt(dic[nome])}</td></tr>'
+            for nome in ordem if nome in dic
+        )
+        return itens
+
+    total = _fmt(agg["total"]) if agg["total"] is not None else "—"
+    op = linhas(agg["operadora"], ("Vivo", "Claro", "TIM", "Outras"))
+    tec = linhas(agg["tecnologia"], ("2G", "3G", "4G", "5G", "Outras"))
+    bloco_op = (f'<div style="font-size:11px;font-weight:600;color:#718096;'
+                f'text-transform:uppercase;letter-spacing:1px;margin:18px 0 6px;">'
+                f'Por operadora</div><table width="100%">{op}</table>') if op else ""
+    bloco_tec = (f'<div style="font-size:11px;font-weight:600;color:#718096;'
+                 f'text-transform:uppercase;letter-spacing:1px;margin:18px 0 6px;">'
+                 f'Por tecnologia</div><table width="100%">{tec}</table>') if tec else ""
+
+    return f"""<!DOCTYPE html><html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f1f3f5;font-family:-apple-system,
+BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1a202c;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+style="background:#f1f3f5;padding:24px 12px;"><tr><td align="center">
+<table role="presentation" width="600" cellpadding="0" cellspacing="0"
+style="background:#fff;border-radius:10px;overflow:hidden;max-width:600px;width:100%;
+box-shadow:0 1px 3px rgba(0,0,0,.06),0 4px 16px rgba(0,0,0,.04);">
+<tr><td bgcolor="#1e3a8a" style="padding:28px 32px;background-color:#1e3a8a;">
+<div style="font-size:11px;font-weight:700;color:#bfdbfe;letter-spacing:1.5px;
+text-transform:uppercase;">Anatel · Acessos móveis (SMP)</div>
+<div style="margin-top:10px;font-size:22px;font-weight:700;color:#fff;">
+Dado novo: {comp_extenso}</div>
+<div style="margin-top:8px;font-size:13px;color:#dbeafe;">Atualizado em {atualizado}</div>
+</td></tr>
+<tr><td style="padding:24px 32px 4px;">
+<div style="font-size:11px;font-weight:600;color:#718096;text-transform:uppercase;
+letter-spacing:1px;margin-bottom:6px;">Total Brasil</div>
+<div style="font-size:26px;font-weight:700;color:#1a202c;">{total} <span
+style="font-size:14px;font-weight:500;color:#718096;">acessos</span></div>
+{bloco_op}{bloco_tec}
+</td></tr>
+<tr><td style="padding:18px 32px 24px;">
+<a href="{URL_PAINEL}" style="display:inline-block;background:#3182ce;color:#fff;
+padding:12px 22px;border-radius:6px;text-decoration:none;font-weight:600;font-size:14px;">
+Abrir painel da Anatel</a></td></tr>
+<tr><td style="padding:14px 32px;background:#f7fafc;border-top:1px solid #e2e8f0;
+font-size:12px;color:#718096;">Enviado pelo monitor Anatel SMP ·
+{datetime.now():%d/%m/%Y %H:%M}</td></tr>
+</table></td></tr></table></body></html>"""
+
+
+def _render_email_text(comp_extenso, atualizado, agg):
+    """Versão texto puro do alerta (fallback)."""
+    linhas = [f"ANATEL — Acessos móveis (SMP)",
+              f"Dado novo: {comp_extenso} (atualizado em {atualizado})", ""]
+    if agg["total"] is not None:
+        linhas.append(f"Total Brasil: {_fmt(agg['total'])} acessos")
+    if agg["operadora"]:
+        linhas.append("Por operadora:")
+        linhas += [f"  - {n}: {_fmt(agg['operadora'][n])}"
+                   for n in ("Vivo", "Claro", "TIM", "Outras") if n in agg["operadora"]]
+    if agg["tecnologia"]:
+        linhas.append("Por tecnologia:")
+        linhas += [f"  - {n}: {_fmt(agg['tecnologia'][n])}"
+                   for n in ("2G", "3G", "4G", "5G", "Outras") if n in agg["tecnologia"]]
+    linhas += ["", f"Painel: {URL_PAINEL}"]
+    return "\n".join(linhas)
+
+
+def enviar_email(cfg, comp_extenso, atualizado, agg):
+    """Envia o alerta SMTP (porta 465=SSL, demais=STARTTLS). Retorna True/False."""
+    msg = EmailMessage()
+    prefixo = cfg.get("subject_prefix", "[Anatel SMP]")
+    msg["Subject"] = f"{prefixo} Dado novo: {comp_extenso}"
+    msg["From"] = cfg.get("from_addr") or cfg["smtp_username"]
+    destinos = cfg["to_addrs"]
+    if isinstance(destinos, str):
+        destinos = [destinos]
+    msg["To"] = ", ".join(destinos)
+    msg.set_content(_render_email_text(comp_extenso, atualizado, agg))
+    msg.add_alternative(_render_email_html(comp_extenso, atualizado, agg), subtype="html")
+
+    try:
+        host = cfg["smtp_host"]
+        port = int(cfg.get("smtp_port", 587))
+        if port == 465:
+            with smtplib.SMTP_SSL(host, port, timeout=30) as s:
+                s.login(cfg["smtp_username"], cfg["smtp_password"])
+                s.send_message(msg)
+        else:
+            with smtplib.SMTP(host, port, timeout=30) as s:
+                s.starttls()
+                s.login(cfg["smtp_username"], cfg["smtp_password"])
+                s.send_message(msg)
+        print(f"📧 E-mail enviado para {msg['To']}: {msg['Subject']}")
+        return True
+    except (smtplib.SMTPException, OSError) as e:
+        print(f"⚠️  Falha ao enviar e-mail: {e}")
+        return False
+
+
+# ===========================================================================
 # FLUXO PRINCIPAL
 # ===========================================================================
 
@@ -584,7 +742,9 @@ def main():
 
     # 4) Comparar com o alvo e montar a saída.
     houve_novidade = (comp_atual != comp_anterior)
+    primeira_execucao = (comp_anterior is None)
     atingiu_alvo = (comp_atual >= COMPETENCIA_ALVO)
+    agg = montar_agregados(df_comp, mapa)  # calculado sempre (usado na tela e no e-mail)
 
     # Mês por extenso para mensagem amigável.
     meses_pt = ["", "janeiro", "fevereiro", "março", "abril", "maio", "junho",
@@ -593,12 +753,11 @@ def main():
     ano_c, mes_c = comp_atual.split("-")
     alvo_extenso = f"{meses_pt[int(mes_a)]}/{ano_a}"
     atual_extenso = f"{meses_pt[int(mes_c)]}/{ano_c}"
+    atualizado = recurso.get("atualizado_em") or "data não informada pela API"
 
     if atingiu_alvo:
-        atualizado = recurso.get("atualizado_em") or "data não informada pela API"
         print(f"\n✅ DADO NOVO DISPONÍVEL: {alvo_extenso} já está na base "
               f"(atualizado em {atualizado})")
-        agg = montar_agregados(df_comp, mapa)
         imprimir_agregados(agg)
         resultado_log = f"DISPONIVEL competencia={comp_atual} (alvo={COMPETENCIA_ALVO})"
     else:
@@ -609,7 +768,18 @@ def main():
               f"Se quiser confirmar, veja: {URL_PAINEL}")
         resultado_log = f"PENDENTE competencia={comp_atual} (alvo={COMPETENCIA_ALVO})"
 
-    # 5) Log + estado. Silencioso/idempotente quando NÃO houve mudança.
+    # 5) Alerta por e-mail: dispara só quando surge uma competência NOVA (mudou desde
+    #    a última checagem). Na primeira execução apenas registra o estado, sem e-mail
+    #    (evita disparar no "marco zero"). Idempotente: não reenvia se nada mudou.
+    if houve_novidade and not primeira_execucao:
+        cfg = load_email_config()
+        if cfg:
+            enviar_email(cfg, atual_extenso, atualizado, agg)
+    elif primeira_execucao:
+        load_email_config()  # garante criação do template já na 1ª rodada
+        log_verbose("Primeira execução: estado inicial registrado, sem e-mail.")
+
+    # 6) Log + estado. Silencioso/idempotente quando NÃO houve mudança.
     gravar_log(resultado_log)
     salvar_estado({
         "ultima_competencia": comp_atual,
@@ -617,7 +787,7 @@ def main():
         "alvo": COMPETENCIA_ALVO,
     })
 
-    if not houve_novidade and not atingiu_alvo and not VERBOSE:
+    if not houve_novidade and not VERBOSE:
         # Sem novidade desde a última execução: mantém discreto.
         print("   (sem novidade desde a última checagem)")
 
