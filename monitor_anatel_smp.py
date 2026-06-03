@@ -212,14 +212,20 @@ def _camada_api_nova():
     resp = http_get(url, headers=headers)
     dados = resp.json()
     recursos = []
-    # A API nova costuma usar a chave "recursos" (lista) com link/titulo/formato.
+    # A API nova usa a chave "recursos" (lista). Cada recurso traz:
+    #   link, titulo, formato e dataUltimaAtualizacaoArquivo (dd/mm/aaaa).
     lista = dados.get("recursos") or dados.get("resources") or []
     for r in lista:
+        url = (r.get("link") or r.get("url") or "").replace("\\", "/").strip()
+        # Só interessam recursos de dados (CSV/ZIP); ignora glossário PDF etc.
+        if not url.lower().endswith((".csv", ".zip")):
+            continue
         recursos.append({
-            "titulo": r.get("titulo") or r.get("name") or r.get("link", ""),
-            "url": r.get("link") or r.get("url", ""),
+            "titulo": r.get("titulo") or r.get("name") or url.rsplit("/", 1)[-1],
+            "url": url,
             "formato": (r.get("formato") or r.get("format") or "").upper(),
-            "atualizado_em": r.get("dataAtualizacao") or r.get("last_modified"),
+            "atualizado_em": (r.get("dataUltimaAtualizacaoArquivo")
+                              or r.get("dataAtualizacao") or r.get("last_modified")),
         })
     return recursos
 
@@ -323,18 +329,20 @@ def escolher_recurso(recursos):
 
 def baixar(recurso):
     """
-    Baixa o recurso em streaming (chunks) para PASTA_DOWNLOAD. Se for ZIP, extrai e
-    retorna o caminho do CSV interno. Retorna o caminho do CSV em disco.
+    Baixa o recurso em streaming (chunks de 64 KB) para PASTA_DOWNLOAD, preservando a
+    extensão real da URL (.zip ou .csv). NÃO extrai o ZIP — o pandas lê o CSV de dentro
+    direto via compression (evita gravar ~10 GB extraídos em disco). Retorna o caminho.
     """
     os.makedirs(PASTA_DOWNLOAD, exist_ok=True)
-    nome = recurso["titulo"].split("?")[0] or "download"
-    if not nome.lower().endswith((".csv", ".zip")):
-        nome += ".zip" if recurso["formato"] == "ZIP" else ".csv"
-    destino = os.path.join(PASTA_DOWNLOAD, nome)
+    # A extensão correta vem da URL (o "formato" da API diz CSV mesmo sendo .zip).
+    ext = ".zip" if recurso["url"].lower().endswith(".zip") else ".csv"
+    destino = os.path.join(PASTA_DOWNLOAD, "acessos_telefonia_movel" + ext)
 
     print(f"⬇️  Baixando {recurso['url']}")
     resp = http_get(recurso["url"], stream=True)
     total = int(resp.headers.get("Content-Length", 0))
+    if total:
+        print(f"   (tamanho: {total / 1e9:.2f} GB — pode demorar)")
     baixado = 0
     with open(destino, "wb") as f:
         for chunk in resp.iter_content(chunk_size=1 << 16):  # 64 KB
@@ -343,35 +351,31 @@ def baixar(recurso):
                 baixado += len(chunk)
     log_verbose(f"Gravado {baixado:,} bytes em {destino}"
                 + (f" (esperado {total:,})" if total else ""))
-
-    # Se for ZIP, extrai o primeiro CSV de dentro.
-    if destino.lower().endswith(".zip"):
-        with zipfile.ZipFile(destino) as z:
-            internos = [n for n in z.namelist() if n.lower().endswith(".csv")]
-            if not internos:
-                raise RuntimeError("ZIP baixado não contém nenhum .csv")
-            z.extract(internos[0], PASTA_DOWNLOAD)
-            destino = os.path.join(PASTA_DOWNLOAD, internos[0])
-            log_verbose(f"CSV extraído do ZIP: {destino}")
-
     return destino
+
+
+def _compression(caminho):
+    """Deixa o pandas inferir compressão pela extensão (.zip lê o CSV de dentro)."""
+    return "zip" if caminho.lower().endswith(".zip") else "infer"
 
 
 def detectar_formato(caminho):
     """
     Lê só o cabeçalho testando latin-1/";" (padrão Anatel) e, se falhar, utf-8/",".
+    Funciona tanto em .csv quanto em .zip (compressão inferida pela extensão).
     Retorna (encoding, separador, mapa_de_colunas). Confirma o header antes de assumir.
     """
+    comp = _compression(caminho)
     tentativas = [("latin-1", ";"), ("utf-8", ";"), ("latin-1", ","), ("utf-8", ",")]
     for enc, sep in tentativas:
         try:
-            head = pd.read_csv(caminho, sep=sep, encoding=enc, nrows=0)
+            head = pd.read_csv(caminho, sep=sep, encoding=enc, nrows=0, compression=comp)
         except (UnicodeDecodeError, pd.errors.ParserError, ValueError):
             continue
         # Considera válido se quebrou em mais de uma coluna.
         if len(head.columns) > 1:
             colunas = list(head.columns)
-            log_verbose(f"Aberto com encoding={enc}, sep='{sep}'.")
+            log_verbose(f"Aberto com encoding={enc}, sep='{sep}', compression={comp}.")
             log_verbose(f"Colunas detectadas: {colunas}")
             return enc, sep, _mapear_colunas(colunas)
     raise RuntimeError("Não consegui interpretar o cabeçalho do CSV (encoding/sep).")
@@ -398,9 +402,10 @@ def _mapear_colunas(colunas):
 
 def competencia_mais_recente(caminho, enc, sep, mapa):
     """
-    1º passe: lê em chunks só (Ano, Mês) e acha a competência máxima.
-    2º passe: carrega só as linhas dessa competência (para agregados).
-    Retorna (comp_str "AAAA-MM", DataFrame_da_competencia).
+    Lê o arquivo em UM passe (chunks), agregando por competência já dentro de cada
+    chunk para manter a memória baixa mesmo num CSV de ~10 GB. Ao final identifica a
+    competência (Ano/Mês) mais recente e devolve só as linhas agregadas dela.
+    Retorna (comp_str "AAAA-MM", DataFrame_já_agregado_da_competência).
     """
     col_ano, col_mes = mapa["ano"], mapa["mes"]
     if not col_ano or not col_mes:
@@ -409,38 +414,45 @@ def competencia_mais_recente(caminho, enc, sep, mapa):
             f"Colunas mapeadas: {mapa}"
         )
 
-    max_ano = max_mes = -1
-    leitor = pd.read_csv(caminho, sep=sep, encoding=enc, usecols=[col_ano, col_mes],
-                         chunksize=CHUNKSIZE)
+    # Dimensões de agrupamento disponíveis (operadora/tecnologia são opcionais).
+    dims = [col_ano, col_mes]
+    for papel in ("operadora", "tecnologia"):
+        if mapa[papel]:
+            dims.append(mapa[papel])
+    col_qtd = mapa["qtd"]
+    usecols = dims + ([col_qtd] if col_qtd else [])
+
+    partes = []
+    leitor = pd.read_csv(caminho, sep=sep, encoding=enc, usecols=usecols,
+                         chunksize=CHUNKSIZE, compression=_compression(caminho))
     for chunk in leitor:
         chunk = chunk.dropna(subset=[col_ano, col_mes])
-        # Converte para inteiro de forma tolerante.
-        anos = pd.to_numeric(chunk[col_ano], errors="coerce")
-        meses = pd.to_numeric(chunk[col_mes], errors="coerce")
-        validos = anos.notna() & meses.notna()
-        if not validos.any():
+        chunk[col_ano] = pd.to_numeric(chunk[col_ano], errors="coerce")
+        chunk[col_mes] = pd.to_numeric(chunk[col_mes], errors="coerce")
+        chunk = chunk.dropna(subset=[col_ano, col_mes])
+        if chunk.empty:
             continue
-        chave = anos[validos] * 100 + meses[validos]
-        topo = int(chave.max())
-        if topo > (max_ano * 100 + max_mes):
-            max_ano, max_mes = topo // 100, topo % 100
+        if col_qtd:
+            chunk[col_qtd] = pd.to_numeric(chunk[col_qtd], errors="coerce").fillna(0)
+            g = chunk.groupby(dims, dropna=False)[col_qtd].sum().reset_index()
+        else:
+            g = chunk[dims].drop_duplicates()
+        partes.append(g)
 
-    if max_ano < 0:
-        raise RuntimeError("Não consegui ler nenhuma competência válida no CSV.")
+    if not partes:
+        raise RuntimeError("Não consegui ler nenhuma competência válida no arquivo.")
 
+    # Colapsa o que foi acumulado por chunk (resultado pequeno: meses × dims).
+    acc = pd.concat(partes, ignore_index=True)
+    if col_qtd:
+        acc = acc.groupby(dims, dropna=False)[col_qtd].sum().reset_index()
+
+    max_ano = int(acc[col_ano].max())
+    max_mes = int(acc[acc[col_ano] == max_ano][col_mes].max())
     comp_str = f"{max_ano:04d}-{max_mes:02d}"
     log_verbose(f"Competência mais recente encontrada: {comp_str}")
 
-    # 2º passe: junta só as linhas da competência mais recente.
-    partes = []
-    leitor = pd.read_csv(caminho, sep=sep, encoding=enc, chunksize=CHUNKSIZE)
-    for chunk in leitor:
-        anos = pd.to_numeric(chunk[col_ano], errors="coerce")
-        meses = pd.to_numeric(chunk[col_mes], errors="coerce")
-        filtro = (anos == max_ano) & (meses == max_mes)
-        if filtro.any():
-            partes.append(chunk[filtro])
-    df_comp = pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
+    df_comp = acc[(acc[col_ano] == max_ano) & (acc[col_mes] == max_mes)].copy()
     return comp_str, df_comp
 
 
@@ -687,6 +699,8 @@ def main():
     )
     parser.add_argument("--verbose", action="store_true",
                         help="Mostra detalhes e força a saída completa mesmo sem novidade.")
+    parser.add_argument("--force", action="store_true",
+                        help="Ignora o gate de data e baixa/relê o arquivo mesmo sem mudança.")
     args = parser.parse_args()
     VERBOSE = args.verbose
 
@@ -695,6 +709,7 @@ def main():
 
     estado = carregar_estado()
     comp_anterior = estado.get("ultima_competencia")
+    data_arquivo_anterior = estado.get("ultima_atualizacao_arquivo")
 
     # 1) Descobrir recursos do dataset.
     recursos = descobrir_recursos()
@@ -715,11 +730,25 @@ def main():
         gravar_log(f"ERRO: {msg}")
         sys.exit(2)
 
-    if recurso.get("atualizado_em"):
-        print(f"📦 Recurso: {recurso['titulo']} "
-              f"(última atualização do recurso: {recurso['atualizado_em']})")
+    data_arquivo = recurso.get("atualizado_em")
+    if data_arquivo:
+        print(f"📦 Recurso: {recurso['titulo']} (arquivo atualizado em {data_arquivo})")
     else:
         print(f"📦 Recurso: {recurso['titulo']}")
+
+    # 2b) GATE DE DATA: o arquivo é o consolidado de ~3 GB. Em vez de baixá-lo a cada
+    #     execução, comparamos a data de atualização do arquivo (vinda da API, barata)
+    #     com a da última checagem. Se não mudou, não há competência nova — saímos sem
+    #     baixar nada. O download pesado só acontece quando o arquivo realmente muda
+    #     (~1x/mês). Use --force para ignorar o gate.
+    if (not args.force and data_arquivo and comp_anterior is not None
+            and data_arquivo == data_arquivo_anterior):
+        print(f"   (sem novidade — arquivo inalterado desde {data_arquivo}; "
+              f"competência conhecida: {comp_anterior}. Pulando download de ~3 GB.)")
+        estado["ultima_checagem"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        salvar_estado(estado)
+        gravar_log(f"SEM_MUDANCA arquivo={data_arquivo} competencia={comp_anterior}")
+        return
 
     try:
         caminho = baixar(recurso)
@@ -783,6 +812,7 @@ def main():
     gravar_log(resultado_log)
     salvar_estado({
         "ultima_competencia": comp_atual,
+        "ultima_atualizacao_arquivo": data_arquivo,
         "ultima_checagem": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "alvo": COMPETENCIA_ALVO,
     })

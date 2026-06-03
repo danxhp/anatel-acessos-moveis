@@ -70,15 +70,20 @@ Arquivo principal: [monitor_anatel_smp.py](monitor_anatel_smp.py).
      (manda header `chave-api-dados-abertos` se a env var `CHAVE_DADOS_GOV` existir)
      → C) fallback raspando a página HTML por links `.csv`/`.zip`.
    - Usa a primeira camada que retornar recursos.
-2. **Leitura em chunks** (`competencia_mais_recente`): o consolidado de SMP é gigante
-   (série desde 2007). 1º passe acha o `max(Ano, Mês)`; 2º passe carrega só as linhas
-   da competência mais recente. Preferir sempre o CSV do ano corrente, se existir.
-3. **Cabeçalho confirmado antes de assumir** (`detectar_formato`/`_mapear_colunas`):
+2. **Leitura em 1 passe + ZIP direto** (`competencia_mais_recente`): a API só
+   disponibiliza **um ZIP consolidado de ~3 GB** (`acessos_telefonia_movel.zip`, CSV
+   desde 2007). O arquivo é lido em chunks **sem extrair** (pandas `compression='zip'`,
+   evita ~10 GB em disco), agregando por competência dentro de cada chunk.
+3. **Gate de data (essencial)**: a API informa `dataUltimaAtualizacaoArquivo`. O script
+   só baixa os 3 GB quando essa data muda vs. o estado salvo (`--force` ignora o gate).
+   Assim o cron de 30 min custa só uma chamada de API leve; o download pesado ocorre
+   ~1x/mês. Estado guarda `ultima_competencia` + `ultima_atualizacao_arquivo`.
+4. **Cabeçalho confirmado antes de assumir** (`detectar_formato`/`_mapear_colunas`):
    nomes de coluna são casados com normalização de acento/caixa (`Ano`, `Mês`,
    `Acessos`, `Grupo Econômico`, `Tecnologia`).
-4. **Nunca afirmar "o dado não saiu"** quando a API pode estar defasada vs. o painel:
+5. **Nunca afirmar "o dado não saiu"** quando a API pode estar defasada vs. o painel:
    nesses casos o script avisa e sugere conferir o painel manualmente.
-5. **Saída em UTF-8 forçada** (`sys.stdout.reconfigure`) porque o console do Windows
+6. **Saída em UTF-8 forçada** (`sys.stdout.reconfigure`) porque o console do Windows
    é cp1252 e quebra com emojis/acentos.
 
 ## Configuração

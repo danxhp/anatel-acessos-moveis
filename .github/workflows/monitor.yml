@@ -16,7 +16,9 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 30 min cobre o download/leitura do ZIP de ~3 GB nas raras vezes em que o arquivo
+    # muda; nas demais execuções o gate de data sai em segundos (só consulta a API).
+    timeout-minutes: 30
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
