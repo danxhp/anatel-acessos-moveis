@@ -32,9 +32,11 @@ import json
 import os
 import re
 import smtplib
+import struct
 import sys
 import time
 import zipfile
+import zlib
 from datetime import datetime, date
 from email.message import EmailMessage
 import unicodedata
@@ -88,6 +90,11 @@ URL_PAINEL = "https://informacoes.anatel.gov.br/paineis/acessos/telefonia-movel"
 
 # Tamanho do chunk ao ler o CSV em pedaços (evita estourar memória no consolidado).
 CHUNKSIZE = 200_000
+
+# Tipos de produto excluídos do total "manchete" da Anatel. O arquivo oficial
+# Acessos_Telefonia_Movel_Total.csv NÃO conta M2M nem pontos de serviço; excluindo
+# esses dois, o detalhe bate exatamente com o total oficial (acessos "pessoais").
+EXCLUIR_TIPO_PRODUTO = {"M2M", "PONTO_DE_SERVICO"}
 
 # Variável global ligada por --verbose.
 VERBOSE = False
@@ -327,131 +334,256 @@ def escolher_recurso(recursos):
 # DOWNLOAD E LEITURA DO CSV
 # ===========================================================================
 
-def baixar(recurso):
-    """
-    Baixa o recurso em streaming (chunks de 64 KB) para PASTA_DOWNLOAD, preservando a
-    extensão real da URL (.zip ou .csv). NÃO extrai o ZIP — o pandas lê o CSV de dentro
-    direto via compression (evita gravar ~10 GB extraídos em disco). Retorna o caminho.
-    """
-    os.makedirs(PASTA_DOWNLOAD, exist_ok=True)
-    # A extensão correta vem da URL (o "formato" da API diz CSV mesmo sendo .zip).
-    ext = ".zip" if recurso["url"].lower().endswith(".zip") else ".csv"
-    destino = os.path.join(PASTA_DOWNLOAD, "acessos_telefonia_movel" + ext)
+def _req_headers(extra=None):
+    """Headers de navegador para os requests diretos (Range)."""
+    h = {"User-Agent": USER_AGENT}
+    if extra:
+        h.update(extra)
+    return h
 
-    print(f"⬇️  Baixando {recurso['url']}")
-    resp = http_get(recurso["url"], stream=True)
-    total = int(resp.headers.get("Content-Length", 0))
-    if total:
-        print(f"   (tamanho: {total / 1e9:.2f} GB — pode demorar)")
-    baixado = 0
-    with open(destino, "wb") as f:
-        for chunk in resp.iter_content(chunk_size=1 << 16):  # 64 KB
-            if chunk:
-                f.write(chunk)
-                baixado += len(chunk)
-    log_verbose(f"Gravado {baixado:,} bytes em {destino}"
-                + (f" (esperado {total:,})" if total else ""))
+
+def _zip_listar_membros(url):
+    """
+    Lê SÓ o diretório central do ZIP remoto (últimos ~3 MB) via HTTP Range, sem baixar
+    os ~3 GB. Retorna {nome: {"method", "comp", "lho"}} de cada arquivo de dentro.
+    """
+    h = requests.head(url, headers=_req_headers(), timeout=TIMEOUT)
+    h.raise_for_status()
+    size = int(h.headers["Content-Length"])
+    if h.headers.get("Accept-Ranges") != "bytes":
+        raise RuntimeError("Servidor não suporta HTTP Range; não dá pra extrair membro.")
+    inicio = max(0, size - 3_000_000)
+    r = requests.get(url, headers=_req_headers({"Range": f"bytes={inicio}-"}),
+                     timeout=TIMEOUT)
+    r.raise_for_status()
+    dados = r.content
+    membros = {}
+    sig = b"PK\x01\x02"           # assinatura do cabeçalho do diretório central
+    i = 0
+    while True:
+        j = dados.find(sig, i)
+        if j < 0:
+            break
+        method = struct.unpack("<H", dados[j + 10:j + 12])[0]
+        comp = struct.unpack("<I", dados[j + 20:j + 24])[0]
+        fnlen = struct.unpack("<H", dados[j + 28:j + 30])[0]
+        extlen = struct.unpack("<H", dados[j + 30:j + 32])[0]
+        cmtlen = struct.unpack("<H", dados[j + 32:j + 34])[0]
+        lho = struct.unpack("<I", dados[j + 42:j + 46])[0]
+        nome = dados[j + 46:j + 46 + fnlen].decode("latin-1", "replace")
+        membros[nome] = {"method": method, "comp": comp, "lho": lho}
+        i = j + 46 + fnlen + extlen + cmtlen
+    if not membros:
+        raise RuntimeError("Não consegui ler o diretório central do ZIP.")
+    return membros
+
+
+def _zip_extrair_membro(url, info, destino):
+    """
+    Baixa e descomprime UM membro do ZIP via Range, em streaming e com RETOMADA em caso
+    de queda de conexão (a Anatel derruba o download). Grava o CSV cru em 'destino'.
+    """
+    lho = info["lho"]
+    cab = requests.get(url, headers=_req_headers({"Range": f"bytes={lho}-{lho + 29}"}),
+                       timeout=TIMEOUT)
+    cab.raise_for_status()
+    b = cab.content
+    fnlen = struct.unpack("<H", b[26:28])[0]
+    extlen = struct.unpack("<H", b[28:30])[0]
+    off = lho + 30 + fnlen + extlen        # início dos dados comprimidos do membro
+    comp = info["comp"]
+    deflate = info["method"] == 8
+    dec = zlib.decompressobj(-15) if deflate else None
+
+    pos = 0
+    falhas = 0
+    with open(destino, "wb") as out:
+        while pos < comp:
+            try:
+                r = requests.get(
+                    url,
+                    headers=_req_headers({"Range": f"bytes={off + pos}-{off + comp - 1}"}),
+                    stream=True, timeout=TIMEOUT,
+                )
+                r.raise_for_status()
+                for chunk in r.iter_content(chunk_size=1 << 20):   # 1 MB
+                    if not chunk:
+                        continue
+                    pos += len(chunk)
+                    out.write(dec.decompress(chunk) if deflate else chunk)
+                falhas = 0
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.ChunkedEncodingError,
+                    requests.exceptions.Timeout) as e:
+                falhas += 1
+                if falhas > 10:
+                    raise RuntimeError(f"Muitas quedas baixando o membro do ZIP: {e}")
+                log_verbose(f"Conexão caiu em {pos:,}/{comp:,} bytes; retomando "
+                            f"(tentativa {falhas}).")
+                time.sleep(BACKOFF_BASE)
+        if deflate:
+            out.write(dec.flush())
     return destino
 
 
-def _compression(caminho):
-    """Deixa o pandas inferir compressão pela extensão (.zip lê o CSV de dentro)."""
-    return "zip" if caminho.lower().endswith(".zip") else "infer"
+def _escolher_membros(membros):
+    """
+    Escolhe os CSVs de DADOS do ano corrente (ex.: '..._2026_1S.csv', '..._2026_2S.csv'),
+    ignorando as variantes '_Colunas', totais e PDFs. Se não houver arquivo do ano,
+    cai no pequeno '..._Total.csv' (só total mensal, sem quebra). Retorna lista de nomes.
+    """
+    ano = str(date.today().year)
+    detalhe = [n for n in membros
+               if re.search(rf"_{ano}_\dS\.csv$", n, re.IGNORECASE)
+               and "colunas" not in n.lower()]
+    if detalhe:
+        return sorted(detalhe)
+    total = [n for n in membros if n.lower().endswith("total.csv")
+             and "pre_pos" not in n.lower()]
+    if total:
+        log_verbose(f"Sem arquivo de {ano}; usando fallback {total[0]} (só total).")
+        return total[:1]
+    raise RuntimeError(f"Nenhum CSV de dados do ano {ano} nem total encontrado no ZIP.")
+
+
+def baixar(recurso):
+    """
+    Recurso ZIP: lê o índice remoto, escolhe o(s) CSV(s) do ano corrente e extrai SÓ
+    esse(s) membro(s) via HTTP Range (ex.: ~168 MB do ano em vez dos ~3 GB do ZIP).
+    Recurso CSV: baixa direto. Retorna LISTA de caminhos locais.
+    """
+    os.makedirs(PASTA_DOWNLOAD, exist_ok=True)
+    url = recurso["url"]
+
+    if not url.lower().endswith(".zip"):
+        destino = os.path.join(PASTA_DOWNLOAD, "acessos_telefonia_movel.csv")
+        print(f"⬇️  Baixando {url}")
+        resp = http_get(url, stream=True)
+        with open(destino, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1 << 16):
+                if chunk:
+                    f.write(chunk)
+        return [destino]
+
+    print("🔎 Lendo índice do ZIP remoto (sem baixar os ~3 GB)...")
+    membros = _zip_listar_membros(url)
+    escolhidos = _escolher_membros(membros)
+    caminhos = []
+    for nome in escolhidos:
+        info = membros[nome]
+        destino = os.path.join(PASTA_DOWNLOAD, os.path.basename(nome))
+        print(f"⬇️  Extraindo {nome} (~{info['comp'] / 1e6:.0f} MB compr.) via Range...")
+        _zip_extrair_membro(url, info, destino)
+        caminhos.append(destino)
+    return caminhos
 
 
 def detectar_formato(caminho):
     """
-    Lê só o cabeçalho testando latin-1/";" (padrão Anatel) e, se falhar, utf-8/",".
-    Funciona tanto em .csv quanto em .zip (compressão inferida pela extensão).
-    Retorna (encoding, separador, mapa_de_colunas). Confirma o header antes de assumir.
+    Detecta encoding + separador pelo cabeçalho. ATENÇÃO: os arquivos da Anatel variam —
+    o detalhado é UTF-8 com BOM; outros podem ser latin-1. Como latin-1 NUNCA falha ao
+    decodificar, não basta "abriu": escolhemos a combinação cujo cabeçalho realmente
+    expõe as colunas-chave (Ano e Mês). Retorna (enc, sep, mapa).
     """
-    comp = _compression(caminho)
-    tentativas = [("latin-1", ";"), ("utf-8", ";"), ("latin-1", ","), ("utf-8", ",")]
+    tentativas = [("utf-8-sig", ";"), ("latin-1", ";"),
+                  ("utf-8-sig", ","), ("latin-1", ",")]
+    reserva = None
     for enc, sep in tentativas:
         try:
-            head = pd.read_csv(caminho, sep=sep, encoding=enc, nrows=0, compression=comp)
+            head = pd.read_csv(caminho, sep=sep, encoding=enc, nrows=0)
         except (UnicodeDecodeError, pd.errors.ParserError, ValueError):
             continue
-        # Considera válido se quebrou em mais de uma coluna.
-        if len(head.columns) > 1:
-            colunas = list(head.columns)
-            log_verbose(f"Aberto com encoding={enc}, sep='{sep}', compression={comp}.")
-            log_verbose(f"Colunas detectadas: {colunas}")
-            return enc, sep, _mapear_colunas(colunas)
+        if len(head.columns) <= 1:
+            continue
+        mapa = _mapear_colunas(list(head.columns))
+        if mapa["ano"] and mapa["mes"]:
+            log_verbose(f"Encoding={enc}, sep='{sep}'. Colunas: {list(head.columns)}")
+            return enc, sep, mapa
+        reserva = reserva or (enc, sep, mapa)
+    if reserva:
+        return reserva
     raise RuntimeError("Não consegui interpretar o cabeçalho do CSV (encoding/sep).")
 
 
 def _mapear_colunas(colunas):
-    """Casa as colunas reais com os papéis que precisamos (normalizando acento/caixa)."""
-    mapa = {"ano": None, "mes": None, "qtd": None, "operadora": None, "tecnologia": None}
-    for col in colunas:
-        n = normaliza(col)
+    """Casa as colunas reais com os papéis que precisamos (acento/caixa normalizados).
+    Para tecnologia, PREFERE 'Tecnologia Geração' (já vem como 2G/3G/4G/5G)."""
+    mapa = {"ano": None, "mes": None, "qtd": None, "operadora": None,
+            "tecnologia": None, "produto": None}
+    norms = {col: normaliza(col) for col in colunas}
+    for col, n in norms.items():
         if mapa["ano"] is None and n == "ano":
             mapa["ano"] = col
-        elif mapa["mes"] is None and n in ("mes", "mês"):
+        elif mapa["mes"] is None and n == "mes":
             mapa["mes"] = col
         elif mapa["qtd"] is None and n in ("acessos", "quantidade", "qtde", "qtd_acessos"):
             mapa["qtd"] = col
         elif mapa["operadora"] is None and n in ("grupo economico", "empresa",
                                                  "prestadora", "nome prestadora"):
             mapa["operadora"] = col
-        elif mapa["tecnologia"] is None and n in ("tecnologia", "tecnologia geracao"):
-            mapa["tecnologia"] = col
+        elif mapa["produto"] is None and n in ("tipo de produto", "tipo produto"):
+            mapa["produto"] = col
+    # Tecnologia: prioriza a coluna de Geração; senão, a "Tecnologia" crua.
+    for alvo in ("tecnologia geracao", "tecnologia"):
+        for col, n in norms.items():
+            if n == alvo:
+                mapa["tecnologia"] = col
+                break
+        if mapa["tecnologia"]:
+            break
     return mapa
 
 
-def competencia_mais_recente(caminho, enc, sep, mapa):
+def competencia_mais_recente(caminhos, enc, sep, mapa):
     """
-    Lê o arquivo em UM passe (chunks), agregando por competência já dentro de cada
-    chunk para manter a memória baixa mesmo num CSV de ~10 GB. Ao final identifica a
-    competência (Ano/Mês) mais recente e devolve só as linhas agregadas dela.
-    Retorna (comp_str "AAAA-MM", DataFrame_já_agregado_da_competência).
+    Lê o(s) CSV(s) em UM passe (chunks), agregando por competência dentro de cada chunk
+    p/ memória baixa. Identifica a competência (Ano/Mês) mais recente entre todos os
+    arquivos e devolve só as linhas agregadas dela.
+    Retorna (comp_str "AAAA-MM", DataFrame_agregado_da_competência).
     """
     col_ano, col_mes = mapa["ano"], mapa["mes"]
     if not col_ano or not col_mes:
-        raise RuntimeError(
-            "Não encontrei as colunas de competência ('Ano' e 'Mês') no CSV. "
-            f"Colunas mapeadas: {mapa}"
-        )
-
-    # Dimensões de agrupamento disponíveis (operadora/tecnologia são opcionais).
+        raise RuntimeError("Não encontrei as colunas 'Ano' e 'Mês'. "
+                           f"Colunas mapeadas: {mapa}")
     dims = [col_ano, col_mes]
     for papel in ("operadora", "tecnologia"):
         if mapa[papel]:
             dims.append(mapa[papel])
     col_qtd = mapa["qtd"]
-    usecols = dims + ([col_qtd] if col_qtd else [])
+    col_prod = mapa.get("produto")
+    # 'produto' entra só para filtrar M2M/ponto (não vira dimensão de agrupamento).
+    usecols = dims + ([col_qtd] if col_qtd else []) + ([col_prod] if col_prod else [])
 
     partes = []
-    leitor = pd.read_csv(caminho, sep=sep, encoding=enc, usecols=usecols,
-                         chunksize=CHUNKSIZE, compression=_compression(caminho))
-    for chunk in leitor:
-        chunk = chunk.dropna(subset=[col_ano, col_mes])
-        chunk[col_ano] = pd.to_numeric(chunk[col_ano], errors="coerce")
-        chunk[col_mes] = pd.to_numeric(chunk[col_mes], errors="coerce")
-        chunk = chunk.dropna(subset=[col_ano, col_mes])
-        if chunk.empty:
-            continue
-        if col_qtd:
-            chunk[col_qtd] = pd.to_numeric(chunk[col_qtd], errors="coerce").fillna(0)
-            g = chunk.groupby(dims, dropna=False)[col_qtd].sum().reset_index()
-        else:
-            g = chunk[dims].drop_duplicates()
-        partes.append(g)
+    for caminho in caminhos:
+        leitor = pd.read_csv(caminho, sep=sep, encoding=enc, usecols=usecols,
+                             chunksize=CHUNKSIZE)
+        for chunk in leitor:
+            chunk[col_ano] = pd.to_numeric(chunk[col_ano], errors="coerce")
+            chunk[col_mes] = pd.to_numeric(chunk[col_mes], errors="coerce")
+            chunk = chunk.dropna(subset=[col_ano, col_mes])
+            # Exclui M2M / pontos de serviço para bater com o total oficial da Anatel.
+            if col_prod and EXCLUIR_TIPO_PRODUTO:
+                excl = chunk[col_prod].astype(str).str.strip().str.upper()
+                chunk = chunk[~excl.isin(EXCLUIR_TIPO_PRODUTO)]
+            if chunk.empty:
+                continue
+            if col_qtd:
+                chunk[col_qtd] = pd.to_numeric(chunk[col_qtd], errors="coerce").fillna(0)
+                g = chunk.groupby(dims, dropna=False)[col_qtd].sum().reset_index()
+            else:
+                g = chunk[dims].drop_duplicates()
+            partes.append(g)
 
     if not partes:
-        raise RuntimeError("Não consegui ler nenhuma competência válida no arquivo.")
-
-    # Colapsa o que foi acumulado por chunk (resultado pequeno: meses × dims).
+        raise RuntimeError("Não consegui ler nenhuma competência válida no(s) arquivo(s).")
     acc = pd.concat(partes, ignore_index=True)
     if col_qtd:
         acc = acc.groupby(dims, dropna=False)[col_qtd].sum().reset_index()
-
     max_ano = int(acc[col_ano].max())
     max_mes = int(acc[acc[col_ano] == max_ano][col_mes].max())
     comp_str = f"{max_ano:04d}-{max_mes:02d}"
-    log_verbose(f"Competência mais recente encontrada: {comp_str}")
-
+    log_verbose(f"Competência mais recente: {comp_str}")
     df_comp = acc[(acc[col_ano] == max_ano) & (acc[col_mes] == max_mes)].copy()
     return comp_str, df_comp
 
@@ -460,14 +592,16 @@ def competencia_mais_recente(caminho, enc, sep, mapa):
 # AGREGADOS (total / operadora / tecnologia)
 # ===========================================================================
 
-# Mapeamento dos grupos econômicos para as marcas que interessam.
+# Mapeamento dos grupos econômicos para as marcas que interessam. ATENÇÃO: na base da
+# Anatel a coluna "Grupo Econômico" usa o nome do CONTROLADOR: Telefônica=Vivo,
+# Telecom Americas=Claro (América Móvil), Telecom Italia=TIM.
 def _classifica_operadora(valor):
     n = normaliza(valor)
     if "vivo" in n or "telefonica" in n:
         return "Vivo"
-    if "claro" in n or "america movil" in n or "embratel" in n:
+    if "claro" in n or "america movil" in n or "telecom americas" in n or "embratel" in n:
         return "Claro"
-    if "tim" in n:
+    if "telecom italia" in n or n == "tim" or n.startswith("tim "):
         return "TIM"
     return "Outras"
 
@@ -751,7 +885,7 @@ def main():
         return
 
     try:
-        caminho = baixar(recurso)
+        caminhos = baixar(recurso)
     except (requests.exceptions.RequestException, OSError, RuntimeError,
             zipfile.BadZipFile) as e:
         msg = f"Falha ao baixar/extrair o recurso: {e}. Confira o painel: {URL_PAINEL}"
@@ -759,10 +893,10 @@ def main():
         gravar_log(f"ERRO: {msg}")
         sys.exit(2)
 
-    # 3) Ler o CSV e achar a competência mais recente.
+    # 3) Ler o(s) CSV(s) e achar a competência mais recente.
     try:
-        enc, sep, mapa = detectar_formato(caminho)
-        comp_atual, df_comp = competencia_mais_recente(caminho, enc, sep, mapa)
+        enc, sep, mapa = detectar_formato(caminhos[0])
+        comp_atual, df_comp = competencia_mais_recente(caminhos, enc, sep, mapa)
     except (RuntimeError, pd.errors.ParserError, ValueError) as e:
         msg = f"Falha ao interpretar o CSV: {e}"
         print(f"❌ {msg}")

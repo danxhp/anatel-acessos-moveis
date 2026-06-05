@@ -70,20 +70,27 @@ Arquivo principal: [monitor_anatel_smp.py](monitor_anatel_smp.py).
      (manda header `chave-api-dados-abertos` se a env var `CHAVE_DADOS_GOV` existir)
      → C) fallback raspando a página HTML por links `.csv`/`.zip`.
    - Usa a primeira camada que retornar recursos.
-2. **Leitura em 1 passe + ZIP direto** (`competencia_mais_recente`): a API só
-   disponibiliza **um ZIP consolidado de ~3 GB** (`acessos_telefonia_movel.zip`, CSV
-   desde 2007). O arquivo é lido em chunks **sem extrair** (pandas `compression='zip'`,
-   evita ~10 GB em disco), agregando por competência dentro de cada chunk.
-3. **Gate de data (essencial)**: a API informa `dataUltimaAtualizacaoArquivo`. O script
-   só baixa os 3 GB quando essa data muda vs. o estado salvo (`--force` ignora o gate).
-   Assim o cron de 30 min custa só uma chamada de API leve; o download pesado ocorre
-   ~1x/mês. Estado guarda `ultima_competencia` + `ultima_atualizacao_arquivo`.
-4. **Cabeçalho confirmado antes de assumir** (`detectar_formato`/`_mapear_colunas`):
-   nomes de coluna são casados com normalização de acento/caixa (`Ano`, `Mês`,
-   `Acessos`, `Grupo Econômico`, `Tecnologia`).
-5. **Nunca afirmar "o dado não saiu"** quando a API pode estar defasada vs. o painel:
+2. **Extração por HTTP Range de UM membro** (`_zip_listar_membros` /
+   `_zip_extrair_membro` / `_escolher_membros`): o ZIP de ~3 GB contém **40 arquivos**,
+   inclusive CSVs por ano/semestre (`Acessos_Telefonia_Movel_2026_1S.csv`). O script lê
+   só o diretório central (últimos ~3 MB via Range), escolhe o(s) CSV(s) do ano corrente
+   e baixa/descomprime **apenas esse membro (~168 MB)** — não os 3 GB. Tem **retomada**
+   de conexão (a Anatel derruba o download). NÃO usar pandas `compression='zip'`: o zip
+   é multi-arquivo e o pandas falha.
+3. **Encoding por validação** (`detectar_formato`): o detalhado é **UTF-8 com BOM**
+   (use `utf-8-sig`); outros membros podem ser latin-1. Como latin-1 nunca falha ao
+   decodificar, escolhe-se a combinação cujo cabeçalho realmente expõe `Ano`+`Mês`.
+4. **Total = manchete da Anatel** (`EXCLUIR_TIPO_PRODUTO`): o detalhe soma 274,5 mi em
+   abril/2026, mas inclui `M2M` e `PONTO_DE_SERVICO`. Excluindo os dois, bate exatamente
+   o `Acessos_Telefonia_Movel_Total.csv` oficial (218.484.895). Operadora vem do
+   **controlador**: Telefônica=Vivo, Telecom Americas=Claro, Telecom Italia=TIM.
+5. **Gate de data (essencial)**: a API informa `dataUltimaAtualizacaoArquivo`. O script
+   só baixa o membro quando essa data muda vs. o estado salvo (`--force` ignora o gate).
+   Assim o cron de 30 min custa só uma chamada de API leve; o download ocorre ~1x/mês.
+   Estado guarda `ultima_competencia` + `ultima_atualizacao_arquivo`.
+6. **Nunca afirmar "o dado não saiu"** quando a API pode estar defasada vs. o painel:
    nesses casos o script avisa e sugere conferir o painel manualmente.
-6. **Saída em UTF-8 forçada** (`sys.stdout.reconfigure`) porque o console do Windows
+7. **Saída em UTF-8 forçada** (`sys.stdout.reconfigure`) porque o console do Windows
    é cp1252 e quebra com emojis/acentos.
 
 ## Configuração
