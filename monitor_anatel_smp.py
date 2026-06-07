@@ -848,13 +848,17 @@ def main():
     # 1) Descobrir recursos do dataset.
     recursos = descobrir_recursos()
     if not recursos:
-        msg = ("Não consegui acessar os recursos do dataset por nenhuma camada "
-               "(CKAN/API/HTML). A API do dados.gov.br pode exigir chave "
-               "(defina CHAVE_DADOS_GOV) ou estar fora do ar. "
-               f"Confira manualmente o painel: {URL_PAINEL}")
-        print(f"❌ {msg}")
-        gravar_log(f"ERRO: {msg}")
-        sys.exit(2)
+        # Fonte indisponível (a API do dados.gov.br/Anatel cai com frequência, sobretudo
+        # de madrugada). Isso é TRANSITÓRIO: nada a relatar neste ciclo e tentamos de
+        # novo na próxima execução. Saímos com código 0 para NÃO marcar o run como falha
+        # (evita e-mail de falha do GitHub a cada instabilidade). Fica registrado no log.
+        msg = ("Fonte indisponível agora (nenhuma camada respondeu). Provável "
+               "instabilidade temporária do dados.gov.br/Anatel; tentarei de novo no "
+               "próximo ciclo. Se persistir, confira a chave CHAVE_DADOS_GOV e o painel: "
+               f"{URL_PAINEL}")
+        print(f"⚠️  {msg}")
+        gravar_log(f"FONTE_INDISPONIVEL: {msg}")
+        return
 
     # 2) Escolher e baixar o recurso relevante.
     recurso = escolher_recurso(recursos)
@@ -878,9 +882,9 @@ def main():
     if (not args.force and data_arquivo and comp_anterior is not None
             and data_arquivo == data_arquivo_anterior):
         print(f"   (sem novidade — arquivo inalterado desde {data_arquivo}; "
-              f"competência conhecida: {comp_anterior}. Pulando download de ~3 GB.)")
-        estado["ultima_checagem"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        salvar_estado(estado)
+              f"competência conhecida: {comp_anterior}. Pulando download.)")
+        # NÃO regravar o estado aqui: manter estado.json idêntico evita um commit do bot
+        # a cada execução (antes gerava ruído de ~1 commit por run de 30 min).
         gravar_log(f"SEM_MUDANCA arquivo={data_arquivo} competencia={comp_anterior}")
         return
 
